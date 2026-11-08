@@ -1,0 +1,9 @@
+{
+  "id": "palimserest",
+  "name": "Palimserest",
+  "version": "0.1.0",
+  "minAppVersion": "1.11.4",
+  "description": "Hover over words in English excerpts to see definitions and play pronunciations.",
+  "author": "Palimserest",
+  "isDesktopOnly": true
+}
