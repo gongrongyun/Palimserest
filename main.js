@@ -20,6 +20,11 @@ const REQUEST_TIMEOUT = 2500;
 const MAX_SENSES = 3;
 const LEARNERS_NAME = "Merriam-Webster's Learner's Dictionary with Audio";
 const LEARNERS_ENDPOINT = "https://www.dictionaryapi.com/api/v3/references/learners/json/";
+const LEARNERS_AUDIO_BASE = "https://media.merriam-webster.com/audio/prons/en/us/mp3/";
+const LOOKUP_CACHE_KEY = "palimserest-learners-cache-v1";
+const LOOKUP_CACHE_LIMIT = 512;
+const LOOKUP_CACHE_TTL = 7 * 24 * 60 * 60 * 1000;
+const REQUEST_COUNT_KEY = "palimserest-daily-requests";
 const ENGLISH_WORD = /\p{Script=Latin}[\p{Script=Latin}\p{M}]*(?:['’ʼ\-‐‑]\p{Script=Latin}[\p{Script=Latin}\p{M}]*)*/gu;
 
 const SKIP_RENDERED = "a, code, pre, .math, mjx-container, .internal-embed, .markdown-embed, .metadata-container, .footnote-ref, img, svg";
@@ -86,6 +91,13 @@ function array(value) {
   return Array.isArray(value) ? value : [];
 }
 
+function localDateKey() {
+  const now = new Date();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return now.getFullYear() + "-" + month + "-" + day;
+}
+
 function headword(value) {
   return typeof value === "string" ? value.replace(/\*/g, "").replace(/:\d+$/, "").trim() : "";
 }
@@ -96,7 +108,7 @@ function audioUrl(id) {
     : id.startsWith("gg") ? "gg"
     : /^[0-9_-]/.test(id) ? "number"
     : id[0];
-  return "https://media.merriam-webster.com/audio/prons/en/us/mp3/" + subdirectory + "/" + id + ".mp3";
+  return LEARNERS_AUDIO_BASE + subdirectory + "/" + id + ".mp3";
 }
 
 function pronunciations(records, form) {
@@ -153,10 +165,75 @@ class LookupError extends Error {
   }
 }
 
+function isCachedGroup(group) {
+  return typeof group?.word === "string" && typeof group.part === "string" &&
+    Array.isArray(group.definitions) && group.definitions.every(definition => typeof definition === "string") &&
+    Array.isArray(group.pronunciations) && group.pronunciations.every(pronunciation =>
+      typeof pronunciation?.form === "string" && typeof pronunciation.ipa === "string" &&
+      typeof pronunciation.label === "string" && typeof pronunciation.url === "string" &&
+      (pronunciation.url === "" || pronunciation.url.startsWith(LEARNERS_AUDIO_BASE))
+    );
+}
+
 class Dictionary {
   constructor(plugin) {
     this.plugin = plugin;
     this.inFlight = new Map();
+
+    const now = Date.now();
+    const savedCache = array(this.loadLocal(LOOKUP_CACHE_KEY)).slice(-LOOKUP_CACHE_LIMIT);
+    this.cache = new Map(savedCache.filter(entry =>
+      typeof entry?.query === "string" && Number.isFinite(entry.expiresAt) && entry.expiresAt > now &&
+      Array.isArray(entry.groups) && entry.groups.every(isCachedGroup)
+    ).map(entry => [entry.query, entry]));
+
+    const usage = this.loadLocal(REQUEST_COUNT_KEY);
+    this.usage = typeof usage?.date === "string" && Number.isSafeInteger(usage.count) && usage.count >= 0
+      ? usage
+      : { date: "", count: 0 };
+  }
+
+  loadLocal(key) {
+    try {
+      return this.plugin.app.loadLocalStorage(key);
+    } catch {
+      return null;
+    }
+  }
+
+  saveLocal(key, value) {
+    try {
+      this.plugin.app.saveLocalStorage(key, value);
+    } catch (error) {
+      console.warn("Palimserest could not save local dictionary data.", error);
+    }
+  }
+
+  get todayRequestCount() {
+    return this.usage.date === localDateKey() ? this.usage.count : 0;
+  }
+
+  recordRequest() {
+    const date = localDateKey();
+    const count = this.usage.date === date ? this.usage.count + 1 : 1;
+    this.usage = { date, count };
+    this.saveLocal(REQUEST_COUNT_KEY, this.usage);
+    this.plugin.settingsTab?.refreshRequestCount();
+  }
+
+  cachedLookup(query) {
+    const entry = this.cache.get(query);
+    if (!entry) return null;
+    this.cache.delete(query);
+    if (entry.expiresAt <= Date.now()) return null;
+    this.cache.set(query, entry);
+    return { source: "learners", groups: entry.groups };
+  }
+
+  rememberLookup(query, groups) {
+    this.cache.set(query, { query, groups, expiresAt: Date.now() + LOOKUP_CACHE_TTL });
+    if (this.cache.size > LOOKUP_CACHE_LIMIT) this.cache.delete(this.cache.keys().next().value);
+    this.saveLocal(LOOKUP_CACHE_KEY, [...this.cache.values()]);
   }
 
   async lookup(text) {
@@ -182,6 +259,8 @@ class Dictionary {
     const secretName = this.plugin.settings.secretName;
     const key = secretName && this.plugin.app.secretStorage.getSecret(secretName)?.trim();
     if (!key) throw new LookupError("请在 Palimserest 设置里选择 API Key。");
+    const cached = this.cachedLookup(query);
+    if (cached) return cached;
     const existing = this.inFlight.get(query);
     if (existing) return existing;
 
@@ -189,10 +268,15 @@ class Dictionary {
     const timeout = new Promise((_, reject) => {
       timer = window.setTimeout(() => reject(new LookupError("查询超时。", true)), REQUEST_TIMEOUT);
     });
-    const request = Promise.race([this.fetch(query, key), timeout]).finally(() => {
-      window.clearTimeout(timer);
-      if (this.inFlight.get(query) === request) this.inFlight.delete(query);
-    });
+    const request = Promise.race([this.fetch(query, key), timeout])
+      .then(result => {
+        if (this.inFlight.get(query) === request) this.rememberLookup(query, result.groups);
+        return result;
+      })
+      .finally(() => {
+        window.clearTimeout(timer);
+        if (this.inFlight.get(query) === request) this.inFlight.delete(query);
+      });
     this.inFlight.set(query, request);
     return request;
   }
@@ -201,6 +285,7 @@ class Dictionary {
     let response;
     try {
       const url = LEARNERS_ENDPOINT + encodeURIComponent(query) + "?key=" + encodeURIComponent(key);
+      this.recordRequest();
       response = await requestUrl({ url, throw: false });
     } catch {
       throw new LookupError("连接词典失败。", true);
@@ -534,6 +619,12 @@ class PalimserestSettings extends PluginSettingTab {
     const { containerEl, plugin } = this;
     containerEl.replaceChildren();
     addElement(containerEl, "p", "", "在摘抄笔记的属性里将 english-hover 设为 true。");
+    const requests = new Setting(containerEl)
+      .setName("今日词典请求次数")
+      .setDesc("按本机日期统计本库实际发出的联网查词请求。缓存命中、离线样例和录音点播不计入。");
+    this.requestCountEl = addElement(requests.controlEl, "span", "");
+    this.refreshRequestCount();
+
     const source = new Setting(containerEl)
       .setName("词典来源")
       .setDesc("内置样例可离线试用。得到词典方对悬停查询的许可后，选择 Merriam-Webster。")
@@ -562,6 +653,14 @@ class PalimserestSettings extends PluginSettingTab {
     logo.height = 50;
     logo.src = "https://dictionaryapi.com/images/info/branding-guidelines/MWLogo_LightBG_120x120_2x.png";
   }
+
+  refreshRequestCount() {
+    if (this.requestCountEl) this.requestCountEl.textContent = String(this.plugin.dictionary.todayRequestCount);
+  }
+
+  hide() {
+    this.requestCountEl = null;
+  }
 }
 
 module.exports = class Palimserest extends Plugin {
@@ -575,7 +674,9 @@ module.exports = class Palimserest extends Plugin {
     this.sections = new WeakMap();
     this.editors = new WeakMap();
     this.cards = new Map();
-    this.addSettingTab(new PalimserestSettings(this));
+    this.settingsTab = new PalimserestSettings(this);
+    this.addSettingTab(this.settingsTab);
+    this.registerInterval(window.setInterval(() => this.settingsTab.refreshRequestCount(), 60_000));
 
     this.registerMarkdownPostProcessor((element, context) => {
       this.sections.set(element, context.sourcePath);
@@ -617,6 +718,7 @@ module.exports = class Palimserest extends Plugin {
   }
 
   onunload() {
+    this.dictionary?.inFlight.clear();
     for (const card of this.cards?.values() ?? []) card.dispose();
     this.cards?.clear();
   }
