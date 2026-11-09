@@ -1,3 +1,12 @@
+::highlight(palimserest-hover-word) {
+  background-color: var(--text-highlight-bg, rgba(250, 200, 60, 0.35));
+}
+
+.palimserest-hover-target,
+.palimserest-hover-target * {
+  cursor: pointer !important;
+}
+
 .palimserest-lookup {
   position: fixed;
   z-index: var(--layer-popover, 30);
