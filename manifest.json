@@ -1,9 +1,9 @@
 {
   "id": "palimserest",
   "name": "Palimserest",
-  "version": "0.1.2",
+  "version": "0.1.5",
   "minAppVersion": "1.11.4",
-  "description": "Hover to highlight English words, then click for definitions and pronunciations.",
+  "description": "Look up English words and short selections with hover and click.",
   "author": "Palimserest",
   "isDesktopOnly": true
 }

@@ -7,13 +7,14 @@ const {
   Setting,
   editorInfoField,
   editorLivePreviewField,
+  getLanguage,
+  normalizePath,
   requestUrl,
   setIcon,
 } = require("obsidian");
 const { ViewPlugin } = require("@codemirror/view");
 
 const NOTE_PROPERTY = "english-hover";
-const HOVER_HIGHLIGHT = "palimserest-hover-word";
 const LEARNERS_NAME = "Merriam-Webster's Learner's Dictionary with Audio";
 const LEARNERS_ENDPOINT = "https://www.dictionaryapi.com/api/v3/references/learners/json/";
 const LEARNERS_AUDIO_BASE = "https://media.merriam-webster.com/audio/prons/en/us/mp3/";
@@ -22,57 +23,31 @@ const HOUR_MS = 60 * 60 * 1000;
 const LEGACY_CACHE_HOURS = 7 * 24;
 const LEGACY_MAX_SENSES = 3;
 const REQUEST_COUNT_KEY = "palimserest-daily-requests";
+const HOVER_STYLES = ["fill", "underline"];
 const ENGLISH_WORD = /\p{Script=Latin}[\p{Script=Latin}\p{M}]*(?:['’ʼ\-‐‑]\p{Script=Latin}[\p{Script=Latin}\p{M}]*)*/gu;
 
 const NUMBER_SETTINGS = {
-  hoverDelay: {
-    label: "悬停时长（毫秒）",
-    description: "鼠标停留多久后高亮单词并允许点击查词。",
-    defaultValue: 300, min: 0, max: 10_000,
-  },
-  maxSenses: {
-    label: "卡片释义上限",
-    description: "一次查词最多显示的释义条数。",
-    defaultValue: LEGACY_MAX_SENSES, min: 1, max: 30,
-  },
-  maxWordLength: {
-    label: "单词长度上限",
-    description: "超过此长度的单词会跳过。",
-    defaultValue: 80, min: 1, max: 256,
-  },
-  loadingDelay: {
-    label: "加载提示延迟（毫秒）",
-    description: "点击查词后，查询等待超过此时长才显示「查询中」。",
-    defaultValue: 180, min: 0, max: 10_000,
-  },
-  leaveDelay: {
-    label: "卡片关闭延迟（毫秒）",
-    description: "鼠标离开单词或卡片后，卡片收起前的等待时间。",
-    defaultValue: 220, min: 0, max: 10_000,
-  },
-  requestTimeout: {
-    label: "联网查询超时（毫秒）",
-    description: "等待词典响应的最长时间。",
-    defaultValue: 2500, min: 100, max: 60_000,
-  },
-  cacheLimit: {
-    label: "缓存词条上限",
-    description: "本库最多保存的联网查询结果数。填 0 可关闭缓存。",
-    defaultValue: 512, min: 0, max: 4096,
-  },
-  cacheMaxAgeHours: {
-    label: "缓存有效期（小时）",
-    description: "从查询完成起计算，超期后重新查询。填 0 可关闭缓存。",
-    defaultValue: LEGACY_CACHE_HOURS, min: 0, max: 8760,
-  },
+  hoverDelay: { defaultValue: 300, min: 0, max: 10_000 },
+  maxSenses: { defaultValue: LEGACY_MAX_SENSES, min: 1, max: 30 },
+  maxWordLength: { defaultValue: 80, min: 1, max: 256 },
+  maxSelectionLength: { defaultValue: 80, min: 1, max: 256 },
+  selectionExitDelay: { defaultValue: 220, min: 0, max: 2000 },
+  loadingDelay: { defaultValue: 180, min: 0, max: 10_000 },
+  requestTimeout: { defaultValue: 2500, min: 100, max: 60_000 },
+  autoRetries: { defaultValue: 1, min: 0, max: 5 },
+  retryDelay: { defaultValue: 500, min: 0, max: 10_000 },
+  cacheLimit: { defaultValue: 512, min: 0, max: 4096 },
+  cacheMaxAgeHours: { defaultValue: LEGACY_CACHE_HOURS, min: 0, max: 8760 },
 };
 
+const READING_TEXT = "p, li, blockquote, h1, h2, h3, h4, h5, h6";
 const SKIP_RENDERED = "a, code, pre, .math, mjx-container, .internal-embed, .markdown-embed, .metadata-container, .footnote-ref, img, svg";
 const SKIP_EDITOR = [
   ".cm-formatting", ".cm-link", ".cm-url", ".cm-hmd-internal-link",
   ".cm-hmd-barelink", ".cm-hmd-footnote", ".cm-inline-code", ".cm-math",
   ".HyperMD-codeblock", ".HyperMD-frontmatter", ".HyperMD-math",
 ].join(", ");
+const SKIP_EDITOR_SELECTION = `${SKIP_RENDERED}, ${SKIP_EDITOR}`;
 
 // These example definitions and synthesized clips are separate from the online dictionary.
 const EXAMPLES = {
@@ -93,7 +68,48 @@ const EXAMPLES = {
   run: [
     ["run", "verb", "To move quickly on foot.", "rʌn", "run"],
   ],
+  play: [
+    ["play", "verb", "To take part in a game or perform a piece of music.", "pleɪ"],
+  ],
+  "take off": [
+    ["take off", "phrasal verb", "To leave the ground and begin to fly."],
+  ],
 };
+
+async function readCatalog(adapter, path) {
+  const text = await adapter.read(path);
+  const catalog = JSON.parse(text.replace(/^\uFEFF/, ""));
+  if (!catalog || typeof catalog !== "object" || Array.isArray(catalog)) {
+    throw new Error(`Invalid Palimserest locale catalog at ${path}`);
+  }
+  return Object.fromEntries(Object.entries(catalog).filter(([, message]) =>
+    typeof message === "string" && message.trim()
+  ));
+}
+
+async function loadTranslator(adapter, directory, language) {
+  const catalogPath = locale => normalizePath(`${directory}/locales/${locale}.json`);
+  let messages = await readCatalog(adapter, catalogPath("en"));
+  const locale = language.toLowerCase().split("-")[0];
+  if (locale !== "en" && /^[a-z]{2,3}$/.test(locale)) {
+    const path = catalogPath(locale);
+    try {
+      if (await adapter.exists(path)) {
+        const localized = await readCatalog(adapter, path);
+        messages = { ...messages, ...localized };
+      }
+    } catch (error) {
+      console.warn(`Palimserest could not read locale ${locale}.`, error);
+    }
+  }
+
+  return (key, values = {}) => {
+    const template = Object.hasOwn(messages, key) ? messages[key] : key;
+    return template.replace(/\{(\w+)\}/g, (placeholder, name) =>
+      Object.hasOwn(values, name) ? String(values[name]) : placeholder
+    );
+  };
+}
 
 function spelling(word) {
   return word.normalize("NFC").replace(/[’ʼ]/g, "'").replace(/[‐‑]/g, "-");
@@ -115,16 +131,77 @@ function wordAt(text, offset, maxLength) {
   return null;
 }
 
-function rectAt(range, x, y) {
-  return Array.from(range.getClientRects()).find(rect =>
-    rect.width > 0 && x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
-  );
+function containsPoint(rect, x, y) {
+  return x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
 }
 
-function sameWord(a, b) {
-  if (!a || !b || a.owner !== b.owner || a.path !== b.path || a.text !== b.text) return false;
+function rectAt(range, x, y) {
+  return Array.from(range.getClientRects()).find(rect => containsPoint(rect, x, y));
+}
+
+function selectionRects(range, excluded) {
+  const root = range.commonAncestorContainer;
+  const element = root.nodeType === 1 ? root : root.parentElement;
+  if (!element || element.closest(excluded)) return [];
+  if (root.nodeType === 3) return Array.from(range.getClientRects()).filter(rect => rect.width && rect.height);
+
+  // A DOM range also reports boxes for fully selected elements. Use only the text fragments.
+  const document = root.ownerDocument;
+  const { SHOW_ELEMENT, SHOW_TEXT, FILTER_ACCEPT, FILTER_REJECT } = document.defaultView.NodeFilter;
+  const walker = document.createTreeWalker(root, SHOW_ELEMENT | SHOW_TEXT, {
+    acceptNode: node => range.intersectsNode(node) ? FILTER_ACCEPT : FILTER_REJECT,
+  });
+  const rects = [];
+  const fragment = document.createRange();
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (node.nodeType === 1) {
+      if (node.matches(excluded)) return [];
+      continue;
+    }
+    const from = node === range.startContainer ? range.startOffset : 0;
+    const to = node === range.endContainer ? range.endOffset : node.length;
+    if (from >= to) continue;
+    fragment.setStart(node, from);
+    fragment.setEnd(node, to);
+    for (const rect of fragment.getClientRects()) {
+      if (rect.width && rect.height) rects.push(rect);
+    }
+  }
+  return rects;
+}
+
+function editorDOMRange(view, from, to) {
+  const start = view.domAtPos(from);
+  const end = view.domAtPos(to, -1);
+  const range = view.dom.ownerDocument.createRange();
+  range.setStart(start.node, start.offset);
+  range.setEnd(end.node, end.offset);
+  return range;
+}
+
+function wordLineRects(range) {
+  // Merge inline fragments on the same line and give wrapped lines their own pill.
+  const lines = [];
+  for (const { left, top, right, bottom, width, height } of range.getClientRects()) {
+    if (width <= 0 || height <= 0) continue;
+    const middle = (top + bottom) / 2;
+    const line = lines.find(line => Math.abs(line.middle - middle) < height / 2);
+    if (line) {
+      line.left = Math.min(line.left, left);
+      line.top = Math.min(line.top, top);
+      line.right = Math.max(line.right, right);
+      line.bottom = Math.max(line.bottom, bottom);
+    } else {
+      lines.push({ left, top, right, bottom, middle });
+    }
+  }
+  return lines;
+}
+
+function sameHit(a, b) {
+  if (!a || !b || a.kind !== b.kind || a.owner !== b.owner || a.path !== b.path || a.text !== b.text) return false;
   // Live Preview can rebuild its text nodes when a click moves the caret.
-  if (a.editorOffset !== undefined) return a.editorOffset === b.editorOffset;
+  if (a.editorFrom !== undefined) return a.editorFrom === b.editorFrom && a.editorTo === b.editorTo;
   return a.range.startContainer === b.range.startContainer && a.range.startOffset === b.range.startOffset &&
     a.range.endContainer === b.range.endContainer && a.range.endOffset === b.range.endOffset;
 }
@@ -205,10 +282,26 @@ function limitSenses(groups, maxSenses) {
 }
 
 class LookupError extends Error {
-  constructor(message, retry = false) {
-    super(message);
+  constructor(code, retry = false) {
+    super(code);
+    this.code = code;
     this.retry = retry;
   }
+}
+
+function waitForRetry(delay, signal) {
+  return new Promise((resolve, reject) => {
+    signal?.throwIfAborted();
+    const timer = window.setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, delay);
+    function abort() {
+      window.clearTimeout(timer);
+      reject(signal.reason);
+    }
+    signal?.addEventListener("abort", abort, { once: true });
+  });
 }
 
 function isCachedGroup(group) {
@@ -222,8 +315,9 @@ function isCachedGroup(group) {
 }
 
 class Dictionary {
-  constructor(plugin) {
+  constructor(plugin, onRequestCountChange) {
     this.plugin = plugin;
+    this.onRequestCountChange = onRequestCountChange;
     this.inFlight = new Map();
 
     const savedCache = array(this.loadLocal(LOOKUP_CACHE_KEY));
@@ -266,7 +360,7 @@ class Dictionary {
     const count = this.usage.date === date ? this.usage.count + 1 : 1;
     this.usage = { date, count };
     this.saveLocal(REQUEST_COUNT_KEY, this.usage);
-    this.plugin.settingsTab?.refreshRequestCount();
+    this.onRequestCountChange?.();
   }
 
   cachedLookup(query) {
@@ -304,8 +398,9 @@ class Dictionary {
     if (dirty || this.cache.size !== oldSize) this.saveLocal(LOOKUP_CACHE_KEY, [...this.cache.values()]);
   }
 
-  async lookup(text) {
-    const query = spelling(text);
+  async lookup(text, { signal, onRetry } = {}) {
+    signal?.throwIfAborted();
+    const query = spelling(text.trim().replace(/\s+/g, " "));
     if (this.plugin.settings.provider !== "learners") {
       const samples = Object.hasOwn(EXAMPLES, wordKey(query)) ? EXAMPLES[wordKey(query)] : [];
       return {
@@ -314,19 +409,41 @@ class Dictionary {
           word,
           part,
           definitions: [definition],
-          pronunciations: [{
+          pronunciations: ipa || clip ? [{
             form: clip === "ran" ? "ran" : word,
-            ipa,
-            url: this.plugin.exampleAudio(clip),
+            ipa: ipa ?? "",
+            url: clip ? this.plugin.exampleAudio(clip) : "",
             label: "",
-          }],
+          }] : [],
         })),
       };
     }
 
     const secretName = this.plugin.settings.secretName;
     const key = secretName && this.plugin.app.secretStorage.getSecret(secretName)?.trim();
-    if (!key) throw new LookupError("请在 Palimserest 设置里选择 API Key。");
+    if (!key) throw new LookupError("missingKey");
+
+    // Each lookup owns its retry schedule. Concurrent lookups can share a network attempt.
+    const { autoRetries, retryDelay } = this.plugin.settings;
+    for (let remaining = autoRetries; ; remaining--) {
+      signal?.throwIfAborted();
+      let result;
+      try {
+        result = await this.lookupLearners(query, key);
+      } catch (error) {
+        signal?.throwIfAborted();
+        const retryable = error instanceof LookupError && error.retry && remaining > 0;
+        if (!retryable) throw error;
+        onRetry?.();
+        await waitForRetry(retryDelay, signal);
+        continue;
+      }
+      signal?.throwIfAborted();
+      return result;
+    }
+  }
+
+  lookupLearners(query, key) {
     const cached = this.cachedLookup(query);
     if (cached) return cached;
     const existing = this.inFlight.get(query);
@@ -334,7 +451,7 @@ class Dictionary {
 
     let timer;
     const timeout = new Promise((_, reject) => {
-      timer = window.setTimeout(() => reject(new LookupError("查询超时。", true)), this.plugin.settings.requestTimeout);
+      timer = window.setTimeout(() => reject(new LookupError("timeout", true)), this.plugin.settings.requestTimeout);
     });
     const request = Promise.race([this.fetch(query, key), timeout])
       .then(result => {
@@ -349,6 +466,10 @@ class Dictionary {
     return request;
   }
 
+  invalidateRequests() {
+    this.inFlight.clear();
+  }
+
   async fetch(query, key) {
     let response;
     try {
@@ -356,25 +477,26 @@ class Dictionary {
       this.recordRequest();
       response = await requestUrl({ url, throw: false });
     } catch {
-      throw new LookupError("连接词典失败。", true);
+      throw new LookupError("connection", true);
     }
     if (response.status === 401 || response.status === 403) {
-      throw new LookupError("词典拒绝请求，请检查 API Key。");
+      throw new LookupError("rejectedKey");
     }
-    if (response.status === 429) throw new LookupError("词典请求达到限额，请稍后再试。");
+    if (response.status === 408) throw new LookupError("timeout", true);
+    if (response.status === 429) throw new LookupError("rateLimit");
     if (response.status === 404) return { source: "learners", groups: [] };
-    if (response.status >= 400) throw new LookupError("词典暂时无法响应。", response.status >= 500);
+    if (response.status >= 400) throw new LookupError("unavailable", response.status >= 500);
 
     let payload;
     try {
       payload = response.json;
     } catch {
-      throw new LookupError("词典返回了无法读取的内容。", true);
+      throw new LookupError("invalidResponse", true);
     }
     if (typeof payload === "string" && /(?:api key|not authorized|access denied)/i.test(payload)) {
-      throw new LookupError("词典拒绝请求，请检查 API Key。");
+      throw new LookupError("rejectedKey");
     }
-    if (!Array.isArray(payload)) throw new LookupError("词典返回了无法读取的内容。", true);
+    if (!Array.isArray(payload)) throw new LookupError("invalidResponse", true);
     return { source: "learners", groups: parseLearners(payload, query) };
   }
 }
@@ -395,62 +517,70 @@ function externalLink(parent, label, url) {
   return link;
 }
 
-class HoverCard {
+class LookupInteraction {
   constructor(plugin, document) {
     this.plugin = plugin;
     this.document = document;
     this.window = document.defaultView;
     this.events = new this.window.AbortController();
-    this.card = addElement(document.body, "aside", "palimserest-lookup");
-    this.card.hidden = true;
-    this.card.setAttribute("aria-label", "单词查词");
+    this.hoverLayer = addElement(document.body, "div", "palimserest-hover-layer");
+    this.hoverLayer.setAttribute("aria-hidden", "true");
+    this.selectionButton = addElement(document.body, "button", "palimserest-selection-button");
+    this.selectionButton.type = "button";
+    this.selectionButton.hidden = true;
+    setIcon(this.selectionButton, "search");
+    this.selectionButton.append(plugin.t("selection.lookup"));
+    this.card = new LookupCard(document, plugin.t);
 
     const listen = (target, event, callback, options) => {
       target.addEventListener(event, callback, { ...options, signal: this.events.signal });
     };
     listen(document, "pointermove", event => this.pointerMove(event), { passive: true });
     listen(document, "pointerdown", event => this.pointerDown(event), { capture: true });
-    listen(document, "pointercancel", () => this.dismiss());
+    listen(document, "pointercancel", () => this.resetHover());
+    listen(document, "contextmenu", () => this.resetHover());
     listen(document, "click", event => this.click(event), { capture: true });
     listen(document, "pointerout", event => {
-      if (!event.relatedTarget) this.dismiss();
+      if (!event.relatedTarget) {
+        this.pointer = null;
+        this.resetHover();
+      }
     });
     listen(document, "scroll", event => {
-      if (!this.card.contains(event.target)) this.dismiss();
+      if (!this.card.element.contains(event.target)) this.resetHover();
     }, { capture: true, passive: true });
-    listen(document, "selectionchange", () => {
-      if (this.hasSelection()) this.dismiss();
-    });
+    listen(document, "selectionchange", () => this.selectionChanged());
     listen(document, "keydown", event => {
       if (event.key !== "Escape") return;
       const hit = this.pending ?? this.ready ?? this.pressed ?? this.active?.hit;
       this.dismiss();
       this.dismissedHit = hit;
     });
-    listen(this.card, "pointerenter", () => {
-      this.cancelFrame();
-      this.clearHover();
-      this.cancelLeave();
+    listen(this.card.element, "pointerenter", () => this.resetHover());
+    listen(this.selectionButton, "mousedown", event => {
+      // Keep the selection and editor focus when pressing the button.
+      if (event.button === 0) event.preventDefault();
     });
-    listen(this.card, "pointerleave", () => this.leave());
-    listen(this.card, "focusout", event => {
-      if (!this.card.contains(event.relatedTarget) && !this.card.matches(":hover")) this.leave();
+    listen(this.selectionButton, "click", () => this.openSelection());
+    listen(this.window, "blur", () => this.resetHover());
+    listen(this.window, "resize", () => {
+      this.resetHover();
+      if (this.active && !this.card.element.hidden) this.card.show(this.active.hit.rect);
     });
-    listen(this.window, "blur", () => this.dismiss());
-    listen(this.window, "resize", () => this.dismiss());
   }
 
   pointerMove(event) {
     if (event.pointerType === "touch") return;
     const moved = event.clientX !== this.pointer?.clientX || event.clientY !== this.pointer?.clientY;
     this.pointer = event;
-    if (this.card.contains(event.target)) return;
-    if (this.hasSelection()) {
-      this.dismiss();
+    if (this.card.element.contains(event.target)) return;
+    if (this.selectionButton.contains(event.target)) {
+      this.cancelFrame();
+      this.cancelSelectionExit();
       return;
     }
     if (event.buttons) {
-      if (!this.pressed || !sameWord(this.pressed, this.hitAtPointer(event))) this.dismiss();
+      if (!this.pressed || !sameHit(this.pressed, this.hitAtPointer(event))) this.resetHover();
       return;
     }
     // Scroll and Escape can leave the pointer over the old word. Wait for a new movement.
@@ -462,137 +592,293 @@ class HoverCard {
   }
 
   pointerDown(event) {
-    if (this.card.contains(event.target)) return;
+    if (this.card.element.contains(event.target) || this.selectionButton.contains(event.target)) return;
     let pressed = null;
-    if (this.ready && event.button === 0 && event.pointerType !== "touch" &&
-        !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && !this.hasSelection()) {
+    if (this.ready?.kind === "word" && event.button === 0 && event.pointerType !== "touch" &&
+        !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey) {
       const hit = this.hitAtPointer(event);
-      if (sameWord(hit, this.ready)) pressed = hit;
+      if (sameHit(hit, this.ready)) pressed = hit;
     }
-    this.dismiss();
+    this.resetHover();
     this.pressed = pressed;
   }
 
   click(event) {
     const pressed = this.pressed;
     this.pressed = null;
-    if (!pressed || event.button !== 0 || event.detail === 0 || event.defaultPrevented || this.hasSelection()) return;
-    const hit = this.hitAtPointer(event);
-    if (sameWord(hit, pressed)) this.open(hit);
+    if (event.button !== 0 || this.card.element.contains(event.target) || this.selectionButton.contains(event.target)) return;
+    const activate = pressed && event.detail !== 0 && !event.defaultPrevented;
+    const hit = activate ? this.hitAtPointer(event) : null;
+    if (sameHit(hit, pressed)) this.open(hit);
+    else this.dismiss();
   }
 
   hitAtPointer({ clientX, clientY }) {
     const target = this.document.elementFromPoint(clientX, clientY);
-    return target && !this.card.contains(target) ? this.plugin.hitAt(target, clientX, clientY) : null;
+    if (!target || this.card.element.contains(target) || this.selectionButton.contains(target)) return null;
+    return this.plugin.hitAt(target, clientX, clientY, this.domSelection());
   }
 
-  hasSelection() {
+  domSelection() {
     const selection = this.document.getSelection();
-    return selection && !selection.isCollapsed && !this.card.contains(selection.anchorNode);
+    return selection && !selection.isCollapsed && !this.card.element.contains(selection.anchorNode) ? selection : null;
+  }
+
+  selectionChanged() {
+    const tracked = this.ready ?? this.pending;
+    if (tracked?.kind === "selection") {
+      if (!sameHit(tracked, this.plugin.selectionFor(tracked))) this.resetHover();
+    } else if (this.domSelection()) {
+      this.resetHover();
+    }
   }
 
   track(hit) {
-    if (sameWord(hit, this.dismissedHit)) return;
+    if (sameHit(hit, this.dismissedHit)) return;
     this.dismissedHit = null;
-    if (sameWord(hit, this.active?.hit)) {
+    if (sameHit(hit, this.active?.hit)) {
       this.clearHover();
-      this.cancelLeave();
       return;
     }
-    if (this.active) {
-      if (this.card.hidden || (hit && this.card.dataset.mode === "loading")) this.close();
-      else this.leave();
+    if (sameHit(hit, this.pending) || sameHit(hit, this.ready)) {
+      this.cancelSelectionExit();
+      return;
     }
-    if (sameWord(hit, this.pending) || sameWord(hit, this.ready)) return;
+    if (!hit && this.ready?.kind === "selection") {
+      this.selectionExitTimer ??= this.window.setTimeout(() => this.clearHover(), this.plugin.settings.selectionExitDelay);
+      return;
+    }
     this.clearHover();
     if (!hit) return;
     this.pending = hit;
     this.dwellTimer = this.window.setTimeout(() => {
       this.pending = null;
-      if (this.hasSelection()) return;
       const current = this.hitAtPointer(this.pointer);
-      if (!sameWord(hit, current)) return;
-      this.ready = current;
-      current.owner.classList.add("palimserest-hover-target");
-      this.window.CSS?.highlights?.set(HOVER_HIGHLIGHT, new this.window.Highlight(current.range));
+      if (!sameHit(hit, current)) return;
+      this.showHover(current);
     }, this.plugin.settings.hoverDelay);
   }
 
-  valid(hit) {
-    return hit.owner.isConnected && hit.range.startContainer.isConnected && this.plugin.enabledFor(hit.path);
+  showHover(hit) {
+    this.ready = hit;
+    if (hit.kind === "selection") {
+      this.showSelectionButton(hit);
+      return;
+    }
+    hit.owner.classList.add("palimserest-hover-target");
+    this.hoverLayer.dataset.style = this.plugin.settings.hoverStyle;
+    for (const { left, top, right, bottom } of wordLineRects(hit.range)) {
+      const mark = addElement(this.hoverLayer, "span", "palimserest-hover-mark");
+      Object.assign(mark.style, {
+        left: left + "px",
+        top: top + "px",
+        width: right - left + "px",
+        height: bottom - top + "px",
+      });
+    }
   }
 
-  open(hit) {
-    this.close();
-    const active = { hit };
+  showSelectionButton(hit) {
+    const { selectionButton: button, window } = this;
+    const margin = 8;
+    const gap = 6;
+    // Exclude text fragments clipped by the note's scroller or covered by pane chrome.
+    const visible = hit.rects.filter(rect => hit.owner.contains(this.document.elementFromPoint(
+      (rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2
+    )));
+    const first = visible[0] ?? hit.rect;
+    const last = visible.at(-1) ?? hit.rect;
+    button.hidden = false;
+    const above = first.top - button.offsetHeight - gap;
+    const maxLeft = window.innerWidth - button.offsetWidth - margin;
+    const maxTop = window.innerHeight - button.offsetHeight - margin;
+    button.style.left = Math.max(margin, Math.min(first.left, maxLeft)) + "px";
+    button.style.top = Math.max(margin, Math.min(above >= margin ? above : last.bottom + gap, maxTop)) + "px";
+  }
+
+  openSelection() {
+    const ready = this.ready;
+    if (ready?.kind !== "selection") return;
+    const selected = this.plugin.selectionFor(ready);
+    this.resetHover();
+    if (sameHit(ready, selected)) this.open({ ...selected, rect: ready.rect });
+  }
+
+  async open(hit) {
+    this.cancelLookup();
+    const controller = new this.window.AbortController();
+    const active = { hit, controller };
     this.active = active;
-    this.loadingTimer = this.window.setTimeout(() => {
-      if (this.active === active && this.valid(hit)) this.status(hit, "查询中…", "loading");
-    }, this.plugin.settings.loadingDelay);
-    this.plugin.dictionary.lookup(hit.text).then(result => {
-      if (this.active !== active) return;
-      this.window.clearTimeout(this.loadingTimer);
-      if (!this.valid(hit)) this.close();
-      else this.result(hit, result);
-    }, error => {
-      if (this.active !== active) return;
-      this.window.clearTimeout(this.loadingTimer);
-      if (!this.valid(hit)) {
-        this.close();
-        return;
-      }
+    const { t } = this.plugin;
+    const showLoading = (key = "card.loading") => {
+      if (this.checkActive(active)) this.card.status(hit, t(key), "loading");
+    };
+    const { loadingDelay } = this.plugin.settings;
+    if (this.card.element.hidden && loadingDelay) {
+      active.loadingTimer = this.window.setTimeout(showLoading, loadingDelay);
+    } else {
+      showLoading();
+    }
+
+    let result;
+    try {
+      result = await this.plugin.dictionary.lookup(hit.text, {
+        signal: controller.signal,
+        onRetry: () => {
+          this.window.clearTimeout(active.loadingTimer);
+          showLoading("card.retrying");
+        },
+      });
+    } catch (error) {
+      if (!this.checkActive(active)) return;
       const known = error instanceof LookupError;
-      this.status(hit, known ? error.message : "查词失败。", "error",
-        known && error.retry ? () => this.open(hit) : null);
-    });
+      const message = t(known ? `error.${error.code}` : "error.generic");
+      const retry = known && error.retry ? () => {
+        if (this.checkActive(active)) this.open(hit);
+      } : null;
+      this.card.status(hit, message, "error", retry);
+      return;
+    } finally {
+      this.window.clearTimeout(active.loadingTimer);
+    }
+    if (this.checkActive(active)) this.card.result(hit, result, this.plugin.settings.maxSenses);
   }
 
-  prepare(hit, mode) {
-    this.card.replaceChildren();
-    this.card.dataset.mode = mode;
-    const title = addElement(this.card, "strong", "palimserest-word", hit.text);
+  checkActive(active) {
+    if (this.active !== active) return false;
+    const { hit } = active;
+    if (hit.owner.isConnected && this.plugin.enabledFor(hit.path)) return true;
+    this.close();
+    return false;
+  }
+
+  clearHover() {
+    this.window.clearTimeout(this.dwellTimer);
+    this.cancelSelectionExit();
+    this.pending = null;
+    if (!this.ready) return;
+    if (this.ready.kind === "selection") {
+      this.selectionButton.hidden = true;
+    } else {
+      this.ready.owner.classList.remove("palimserest-hover-target");
+      this.hoverLayer.replaceChildren();
+    }
+    this.ready = null;
+  }
+
+  cancelSelectionExit() {
+    this.window.clearTimeout(this.selectionExitTimer);
+    this.selectionExitTimer = undefined;
+  }
+
+  cancelFrame() {
+    if (this.frame) this.window.cancelAnimationFrame(this.frame);
+    this.frame = 0;
+  }
+
+  cancelLookup() {
+    const active = this.active;
+    if (!active) return;
+    this.active = null;
+    this.window.clearTimeout(active.loadingTimer);
+    active.controller.abort();
+  }
+
+  close() {
+    this.cancelLookup();
+    this.card.hide();
+  }
+
+  resetHover(keepPress = false) {
+    this.cancelFrame();
+    this.clearHover();
+    if (!keepPress) this.pressed = null;
+    this.dismissedHit = null;
+  }
+
+  dismiss(keepPress = false) {
+    this.resetHover(keepPress);
+    this.close();
+  }
+
+  invalidate(matchesHit, layoutOnly = false) {
+    const hovered = [this.pending, this.ready, this.pressed];
+    if (hovered.some(hit => hit && matchesHit(hit))) this.resetHover(layoutOnly);
+    if (!layoutOnly && this.active && matchesHit(this.active.hit)) this.close();
+  }
+
+  dispose() {
+    this.events.abort();
+    this.dismiss();
+    this.hoverLayer.remove();
+    this.selectionButton.remove();
+    this.card.dispose();
+  }
+}
+
+class LookupCard {
+  constructor(document, t) {
+    this.window = document.defaultView;
+    this.t = t;
+    this.element = addElement(document.body, "aside", "palimserest-lookup");
+    this.element.hidden = true;
+    this.element.setAttribute("aria-label", t("card.label"));
+  }
+
+  prepare(text, mode) {
+    this.element.replaceChildren();
+    this.element.dataset.mode = mode;
+    const title = addElement(this.element, "strong", "palimserest-word", text);
     title.lang = "en";
   }
 
-  status(hit, message, mode, retry) {
-    this.prepare(hit, mode);
-    const status = addElement(this.card, "div", "palimserest-status", message);
+  status({ text, rect }, message, mode, retry) {
+    this.prepare(text, mode);
+    if (mode === "loading") {
+      const skeleton = addElement(this.element, "div", "palimserest-skeleton");
+      skeleton.setAttribute("aria-hidden", "true");
+      for (let line = 0; line < 3; line++) addElement(skeleton, "span");
+    }
+    const status = addElement(this.element, "div", "palimserest-status", message);
     status.setAttribute("role", "status");
     if (retry) {
-      const button = addElement(this.card, "button", "palimserest-retry", "重试");
+      const button = addElement(this.element, "button", "palimserest-retry", this.t("card.retry"));
       button.type = "button";
       button.addEventListener("click", retry);
     }
-    this.show(hit);
+    this.show(rect);
   }
 
-  result(hit, { source, groups }) {
+  result(hit, { source, groups }, maxSenses) {
     if (!groups.length) {
-      this.status(hit, source === "sample"
-        ? "内置样例包含 subtle、yield、record、ran 和 run。"
-        : "词典暂无匹配词条。", "empty");
+      const key = source === "sample" ? "card.sampleNoMatch" : "card.noMatch";
+      this.status(hit, this.t(key), "empty");
       return;
     }
-    this.prepare(hit, "result");
-    for (const group of limitSenses(groups, this.plugin.settings.maxSenses)) this.addGroup(hit, group, source);
-    const footer = addElement(this.card, "footer", "palimserest-source");
-    if (source === "sample") footer.textContent = "内置样例 · 合成发音";
-    else {
+    const { text, rect } = hit;
+    this.prepare(text, "result");
+    const visible = limitSenses(groups, maxSenses);
+    for (const group of visible) this.addGroup(text, group, source);
+    const footer = addElement(this.element, "footer", "palimserest-source");
+    if (source === "sample") {
+      const hasAudio = visible.some(group => group.pronunciations.some(item => item.url));
+      footer.textContent = this.t(hasAudio ? "card.sampleAudioSource" : "card.sampleSource");
+    } else {
       addElement(footer, "span", "", LEARNERS_NAME);
-      externalLink(footer, "查阅词条", "https://www.merriam-webster.com/dictionary/" + encodeURIComponent(groups[0].word));
+      externalLink(footer, this.t("card.dictionaryLink"), "https://www.merriam-webster.com/dictionary/" + encodeURIComponent(groups[0].word));
     }
-    this.show(hit);
+    this.show(rect);
   }
 
-  addGroup(hit, group, source) {
-    const entry = addElement(this.card, "section", "palimserest-entry");
+  addGroup(text, group, source) {
+    const entry = addElement(this.element, "section", "palimserest-entry");
     entry.lang = "en";
     const heading = addElement(entry, "div", "palimserest-entry-heading");
-    if (wordKey(group.word) !== wordKey(hit.text)) addElement(heading, "span", "palimserest-lemma", group.word);
+    if (wordKey(group.word) !== wordKey(text)) addElement(heading, "span", "palimserest-lemma", group.word);
     if (group.part) addElement(heading, "span", "palimserest-part", group.part);
-    const playback = addElement(entry, "div", "palimserest-status");
-    playback.setAttribute("role", "status");
-    playback.hidden = true;
+    const audioStatus = addElement(entry, "div", "palimserest-status");
+    audioStatus.setAttribute("role", "status");
+    audioStatus.hidden = true;
 
     for (const pronunciation of group.pronunciations) {
       const line = addElement(heading, "span", "palimserest-pronunciation");
@@ -603,117 +889,84 @@ class HoverCard {
       if (!pronunciation.url) continue;
       const play = addElement(line, "button", "clickable-icon palimserest-play");
       play.type = "button";
-      const label = (source === "sample" ? "试听样例" : "播放词典录音") + " " +
-        [pronunciation.form, group.part, pronunciation.label].filter(Boolean).join(" ");
+      const pronunciationName = [pronunciation.form, group.part, pronunciation.label].filter(Boolean).join(" ");
+      const label = this.t(source === "sample" ? "audio.playSample" : "audio.playDictionary", {
+        pronunciation: pronunciationName,
+      });
       play.setAttribute("aria-label", label);
       play.title = label;
       setIcon(play, "volume-2");
-      play.addEventListener("click", () => this.play(pronunciation.url, playback));
+      play.addEventListener("click", () => this.play(pronunciation.url, play, audioStatus));
     }
 
     for (const definition of group.definitions) addElement(entry, "p", "palimserest-definition", definition);
   }
 
-  play(url, status) {
+  play(url, button, status) {
     this.stopAudio();
     const audio = new this.window.Audio();
-    this.audio = audio;
-    this.audioStatus = status;
-    status.textContent = "正在加载音频…";
-    status.hidden = false;
+    const playback = { audio, button, status };
+    this.playback = playback;
+    this.setAudioLoading(button, true);
     const failed = () => {
-      if (this.audio !== audio) return;
-      status.textContent = "音频加载失败，可以再次点播。";
+      if (this.playback !== playback || !status.hidden) return;
+      this.setAudioLoading(button, false);
+      status.textContent = this.t("audio.failed");
       status.hidden = false;
     };
     audio.addEventListener("playing", () => {
-      if (this.audio === audio) status.hidden = true;
-    });
+      if (this.playback === playback) this.setAudioLoading(button, false);
+    }, { once: true });
     audio.addEventListener("error", failed, { once: true });
     audio.src = url;
     audio.play().catch(failed);
   }
 
+  setAudioLoading(button, loading) {
+    if ((button.getAttribute("aria-busy") === "true") === loading) return;
+    button.setAttribute("aria-busy", String(loading));
+    button.title = loading ? this.t("audio.loading") : button.getAttribute("aria-label");
+    setIcon(button, loading ? "loader-circle" : "volume-2");
+  }
+
   stopAudio() {
-    if (!this.audio) return;
-    const audio = this.audio;
-    this.audio = null;
-    this.audioStatus.hidden = true;
-    this.audioStatus = null;
+    if (!this.playback) return;
+    const { audio, button, status } = this.playback;
+    this.playback = null;
+    this.setAudioLoading(button, false);
+    status.hidden = true;
     audio.pause();
     audio.removeAttribute("src");
     audio.load();
   }
 
-  show(hit) {
-    const { left, top, bottom } = hit.rect;
+  show({ left, top, bottom }) {
+    const { element } = this;
     const margin = 8;
     const gap = 5;
-    this.card.style.maxHeight = "";
-    this.card.hidden = false;
-    const below = this.window.innerHeight - bottom - gap - margin;
-    const above = top - gap - margin;
-    const openBelow = below >= this.card.offsetHeight || below >= above;
-    this.card.style.maxHeight = Math.max(0, openBelow ? below : above) + "px";
-    this.card.style.top = openBelow ? bottom + gap + "px" : "";
-    this.card.style.bottom = openBelow ? "" : this.window.innerHeight - top + gap + "px";
-    const maxLeft = this.window.innerWidth - this.card.offsetWidth - margin;
-    this.card.style.left = Math.max(margin, Math.min(left, maxLeft)) + "px";
+    const height = this.window.innerHeight;
+    const topEdge = Math.max(margin, bottom + gap);
+    const bottomEdge = Math.max(margin, height - top + gap);
+    element.style.maxHeight = "";
+    element.hidden = false;
+    const below = height - topEdge - margin;
+    const above = height - bottomEdge - margin;
+    const openBelow = below >= element.offsetHeight || below >= above;
+    element.style.maxHeight = Math.max(0, openBelow ? below : above) + "px";
+    element.style.top = openBelow ? topEdge + "px" : "";
+    element.style.bottom = openBelow ? "" : bottomEdge + "px";
+    const maxLeft = this.window.innerWidth - element.offsetWidth - margin;
+    element.style.left = Math.max(margin, Math.min(left, maxLeft)) + "px";
   }
 
-  leave() {
-    if (this.leaveTimer) return;
-    this.leaveTimer = this.window.setTimeout(() => {
-      this.leaveTimer = 0;
-      if (!this.card.matches(":hover") && !this.card.querySelector(":focus-visible")) this.close();
-    }, this.plugin.settings.leaveDelay);
-  }
-
-  clearHover() {
-    this.window.clearTimeout(this.dwellTimer);
-    this.pending = null;
-    if (!this.ready) return;
-    this.ready.owner.classList.remove("palimserest-hover-target");
-    this.window.CSS?.highlights?.delete(HOVER_HIGHLIGHT);
-    this.ready = null;
-  }
-
-  cancelLeave() {
-    this.window.clearTimeout(this.leaveTimer);
-    this.leaveTimer = 0;
-  }
-
-  cancelFrame() {
-    if (this.frame) this.window.cancelAnimationFrame(this.frame);
-    this.frame = 0;
-  }
-
-  close() {
-    this.active = null;
-    this.cancelLeave();
-    this.window.clearTimeout(this.loadingTimer);
-    this.card.hidden = true;
-    this.card.replaceChildren();
-  }
-
-  dismiss(keepPress = false) {
-    this.cancelFrame();
-    this.clearHover();
-    this.close();
-    if (!keepPress) this.pressed = null;
-    this.dismissedHit = null;
-  }
-
-  invalidate(owner, keepPress = false) {
-    if (this.pending?.owner === owner || this.ready?.owner === owner ||
-        this.pressed?.owner === owner || this.active?.hit.owner === owner) this.dismiss(keepPress);
+  hide() {
+    this.element.hidden = true;
+    this.element.replaceChildren();
   }
 
   dispose() {
-    this.events.abort();
-    this.dismiss();
     this.stopAudio();
-    this.card.remove();
+    this.element.remove();
   }
 }
 
@@ -725,19 +978,20 @@ class PalimserestSettings extends PluginSettingTab {
 
   display() {
     const { containerEl, plugin } = this;
+    const { t } = plugin;
     containerEl.replaceChildren();
-    addElement(containerEl, "p", "", "在摘抄笔记的属性里将 english-hover 设为 true。悬停至单词高亮后，点击查词。");
+    addElement(containerEl, "p", "", t("settings.intro", { property: NOTE_PROPERTY }));
     const requests = new Setting(containerEl)
-      .setName("今日词典请求次数")
-      .setDesc("按本机日期统计本库实际发出的联网查词请求。缓存命中、离线样例和录音点播不计入。");
+      .setName(t("settings.requests.label"))
+      .setDesc(t("settings.requests.description"));
     this.requestCountEl = addElement(requests.controlEl, "span", "");
     this.refreshRequestCount();
 
     const source = new Setting(containerEl)
-      .setName("词典来源")
-      .setDesc("内置样例可离线试用。得到词典方的使用许可后，选择 Merriam-Webster。")
+      .setName(t("settings.provider.label"))
+      .setDesc(t("settings.provider.description"))
       .addDropdown(dropdown => dropdown
-        .addOption("sample", "内置样例")
+        .addOption("sample", t("settings.provider.sample"))
         .addOption("learners", LEARNERS_NAME)
         .setValue(plugin.settings.provider)
         .onChange(async provider => {
@@ -745,12 +999,12 @@ class PalimserestSettings extends PluginSettingTab {
           this.display();
         }));
     source.descEl.append(" ");
-    externalLink(source.descEl, "API 条款", "https://dictionaryapi.com/info/terms-of-service");
+    externalLink(source.descEl, t("settings.provider.terms"), "https://dictionaryapi.com/info/terms-of-service");
 
     if (plugin.settings.provider === "learners") {
       new Setting(containerEl)
-        .setName("Learner’s Dictionary API Key")
-        .setDesc("从 Obsidian 的密钥存储选择个人 Key。查词时会把单词和 Key 发送给 Merriam-Webster。")
+        .setName(t("settings.secret.label"))
+        .setDesc(t("settings.secret.description"))
         .addComponent(element => new SecretComponent(plugin.app, element)
           .setValue(plugin.settings.secretName)
           .onChange(name => plugin.saveSetting("secretName", name ?? "")));
@@ -762,11 +1016,25 @@ class PalimserestSettings extends PluginSettingTab {
       logo.src = "https://dictionaryapi.com/images/info/branding-guidelines/MWLogo_LightBG_120x120_2x.png";
     }
 
-    new Setting(containerEl).setName("查词与缓存").setHeading();
-    for (const [name, { label, description, defaultValue, min, max }] of Object.entries(NUMBER_SETTINGS)) {
+    new Setting(containerEl).setName(t("settings.lookupHeading")).setHeading();
+    new Setting(containerEl)
+      .setName(t("settings.hoverStyle.label"))
+      .setDesc(t("settings.hoverStyle.description"))
+      .addDropdown(dropdown => {
+        for (const style of HOVER_STYLES) {
+          dropdown.addOption(style, t("settings.hoverStyle." + style));
+        }
+        dropdown
+          .setValue(plugin.settings.hoverStyle)
+          .onChange(style => plugin.saveSetting("hoverStyle", style));
+      });
+
+    for (const [name, { defaultValue, min, max }] of Object.entries(NUMBER_SETTINGS)) {
+      const label = t(`settings.${name}.label`);
+      const description = t(`settings.${name}.description`);
       new Setting(containerEl)
         .setName(label)
-        .setDesc(`${description} 默认 ${defaultValue}，范围 ${min}–${max}。`)
+        .setDesc(t("settings.numberDescription", { description, defaultValue, min, max }))
         .addText(text => {
           const input = text.inputEl;
           input.type = "number";
@@ -796,19 +1064,24 @@ class PalimserestSettings extends PluginSettingTab {
 
 module.exports = class Palimserest extends Plugin {
   async onload() {
-    const stored = await this.loadData();
+    const [stored, t] = await Promise.all([
+      this.loadData(),
+      loadTranslator(this.app.vault.adapter, this.pluginDirectory, getLanguage()),
+    ]);
+    this.t = t;
     this.settings = {
       provider: stored?.provider === "learners" ? "learners" : "sample",
       secretName: typeof stored?.secretName === "string" ? stored.secretName : "",
+      hoverStyle: HOVER_STYLES.includes(stored?.hoverStyle) ? stored.hoverStyle : HOVER_STYLES[0],
     };
     for (const [name, { defaultValue, min, max }] of Object.entries(NUMBER_SETTINGS)) {
       const value = stored?.[name];
       this.settings[name] = Number.isSafeInteger(value) && value >= min && value <= max ? value : defaultValue;
     }
-    this.dictionary = new Dictionary(this);
+    this.dictionary = new Dictionary(this, () => this.settingsTab?.refreshRequestCount());
     this.sections = new WeakMap();
     this.editors = new WeakMap();
-    this.cards = new Map();
+    this.interactions = new Map();
     this.settingsTab = new PalimserestSettings(this);
     this.addSettingTab(this.settingsTab);
     this.registerInterval(window.setInterval(() => {
@@ -818,7 +1091,7 @@ module.exports = class Palimserest extends Plugin {
 
     this.registerMarkdownPostProcessor((element, context) => {
       this.sections.set(element, context.sourcePath);
-      this.cardFor(element.ownerDocument);
+      this.interactionFor(element.ownerDocument);
     });
 
     const plugin = this;
@@ -826,7 +1099,7 @@ module.exports = class Palimserest extends Plugin {
       constructor(view) {
         this.view = view;
         plugin.editors.set(view.dom, view);
-        plugin.cardFor(view.dom.ownerDocument);
+        plugin.interactionFor(view.dom.ownerDocument);
       }
 
       update(update) {
@@ -835,116 +1108,179 @@ module.exports = class Palimserest extends Plugin {
         const contentChanged = update.docChanged || modeChanged;
         if (contentChanged || update.selectionSet || update.viewportChanged) {
           // A click can move the caret before the click event reaches the document.
-          plugin.cards.get(this.view.dom.ownerDocument)?.invalidate(this.view.dom, !contentChanged);
+          const { dom } = this.view;
+          plugin.interactions.get(dom.ownerDocument)?.invalidate(hit => hit.owner === dom, !contentChanged);
         }
       }
 
       destroy() {
-        plugin.editors.delete(this.view.dom);
-        plugin.cards.get(this.view.dom.ownerDocument)?.invalidate(this.view.dom);
+        const { dom } = this.view;
+        plugin.editors.delete(dom);
+        plugin.interactions.get(dom.ownerDocument)?.invalidate(hit => hit.owner === dom);
       }
     }));
-    this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.dismissCards(true)));
-    this.registerEvent(this.app.workspace.on("file-open", () => this.dismissCards(true)));
+    this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.dismissLookups(true)));
+    this.registerEvent(this.app.workspace.on("file-open", () => this.dismissLookups(true)));
     this.registerEvent(this.app.metadataCache.on("changed", file => {
       if (this.enabledFor(file.path)) return;
-      for (const card of this.cards.values()) {
-        if (card.pending?.path === file.path || card.ready?.path === file.path ||
-            card.pressed?.path === file.path || card.active?.hit.path === file.path) card.dismiss();
-      }
+      for (const interaction of this.interactions.values()) interaction.invalidate(hit => hit.path === file.path);
     }));
     this.registerEvent(this.app.workspace.on("window-close", (_, win) => {
-      this.cards.get(win.document)?.dispose();
-      this.cards.delete(win.document);
+      this.interactions.get(win.document)?.dispose();
+      this.interactions.delete(win.document);
     }));
   }
 
   onunload() {
-    this.dictionary?.inFlight.clear();
-    for (const card of this.cards?.values() ?? []) card.dispose();
-    this.cards?.clear();
+    for (const interaction of this.interactions?.values() ?? []) interaction.dispose();
+    this.interactions?.clear();
+    this.dictionary?.invalidateRequests();
   }
 
   async saveSetting(name, value) {
     if (this.settings[name] === value) return;
     const settings = { ...this.settings, [name]: value };
     this.settings = settings;
-    if (name === "provider" || name === "secretName") this.dictionary.inFlight.clear();
+    if (name === "provider" || name === "secretName") this.dictionary.invalidateRequests();
     if (name === "cacheLimit" || name === "cacheMaxAgeHours") this.dictionary.pruneCache();
-    this.dismissCards();
+    this.dismissLookups();
     this.settingsSave = (this.settingsSave ?? Promise.resolve())
       .catch(() => {})
       .then(() => this.saveData(settings));
     await this.settingsSave;
   }
 
-  dismissCards(keepPress = false) {
-    for (const card of this.cards.values()) card.dismiss(keepPress);
+  dismissLookups(keepPress = false) {
+    for (const interaction of this.interactions.values()) interaction.dismiss(keepPress);
   }
 
-  cardFor(document) {
-    if (!this.cards.has(document)) this.cards.set(document, new HoverCard(this, document));
-    return this.cards.get(document);
+  interactionFor(document) {
+    if (!this.interactions.has(document)) this.interactions.set(document, new LookupInteraction(this, document));
+    return this.interactions.get(document);
   }
 
   enabledFor(path) {
     return Boolean(path) && this.app.metadataCache.getCache(path)?.frontmatter?.[NOTE_PROPERTY] === true;
   }
 
-  exampleAudio(clip) {
-    const folder = this.manifest.dir ?? this.app.vault.configDir + "/plugins/" + this.manifest.id;
-    return this.app.vault.adapter.getResourcePath(folder + "/demo-audio/" + clip + ".wav");
+  get pluginDirectory() {
+    return this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
   }
 
-  hitAt(target, x, y) {
+  exampleAudio(clip) {
+    return this.app.vault.adapter.getResourcePath(`${this.pluginDirectory}/demo-audio/${clip}.wav`);
+  }
+
+  hitAt(target, x, y, selection) {
     if (target.closest(SKIP_RENDERED)) return null;
     const editor = this.editors.get(target.closest(".cm-editor"));
+    const focused = this.editors.get(target.ownerDocument.activeElement?.closest(".cm-editor"));
+    const selectedEditor = [focused, editor].find(view => view?.state.selection.ranges.some(range => !range.empty));
+    if (selectedEditor || selection) {
+      if (selectedEditor && !selectedEditor.contentDOM.contains(target)) return null;
+      if (!selectedEditor && !target.closest(".markdown-reading-view")?.contains(selection.anchorNode)) return null;
+      const hit = selectedEditor ? this.editorSelection(selectedEditor) : this.readingSelection(selection);
+      if (!hit?.owner.contains(target)) return null;
+      const rect = hit.rects.find(rect => containsPoint(rect, x, y));
+      return rect ? { ...hit, rect } : null;
+    }
+
     const hit = editor ? this.editorHit(editor, target, x, y) : this.readingHit(target, x, y);
     if (hit && this.settings.provider === "sample" && !Object.hasOwn(EXAMPLES, wordKey(hit.text))) return null;
-    return hit;
+    return hit ? { ...hit, kind: "word" } : null;
+  }
+
+  readingContext(target) {
+    const reading = target?.closest(".markdown-reading-view");
+    if (!reading || !target.closest(READING_TEXT)) return null;
+    let owner = target;
+    while (owner !== reading && !this.sections.has(owner)) owner = owner.parentElement;
+    const path = this.sections.get(owner);
+    return this.enabledFor(path) ? { owner, path, reading } : null;
   }
 
   readingHit(target, x, y) {
-    const reading = target.closest(".markdown-reading-view");
-    if (!reading || !target.closest("p, li, blockquote, h1, h2, h3, h4, h5, h6")) return null;
-    let section = target;
-    while (section && !this.sections.has(section) && section !== reading) section = section.parentElement;
-    const path = this.sections.get(section);
-    if (!this.enabledFor(path)) return null;
+    const context = this.readingContext(target);
+    if (!context) return null;
+    const { owner, path } = context;
 
-    const document = section.ownerDocument;
+    const document = owner.ownerDocument;
     const caret = document.caretPositionFromPoint?.(x, y);
     const fallback = caret ? null : document.caretRangeFromPoint?.(x, y);
     const node = caret?.offsetNode ?? fallback?.startContainer;
     const offset = caret?.offset ?? fallback?.startOffset;
-    if (node?.nodeType !== 3 || !section.contains(node) || node.parentElement.closest(SKIP_RENDERED)) return null;
+    if (node?.nodeType !== 3 || !owner.contains(node) || node.parentElement.closest(SKIP_RENDERED)) return null;
     const word = wordAt(node.data, offset, this.settings.maxWordLength);
     if (!word) return null;
     const range = document.createRange();
     range.setStart(node, word.from);
     range.setEnd(node, word.to);
     const rect = rectAt(range, x, y);
-    return rect ? { owner: section, path, text: word.text, range, rect } : null;
+    return rect ? { owner, path, text: word.text, range, rect } : null;
+  }
+
+  editorPath(view) {
+    if (!view.state.field(editorLivePreviewField, false)) return null;
+    const path = view.state.field(editorInfoField, false)?.file?.path;
+    return this.enabledFor(path) ? path : null;
   }
 
   editorHit(view, target, x, y) {
-    if (!view.contentDOM.contains(target) || !view.state.field(editorLivePreviewField, false) ||
-        target.closest(SKIP_EDITOR) || view.state.selection.ranges.some(range => !range.empty)) return null;
-    const path = view.state.field(editorInfoField, false)?.file?.path;
-    if (!this.enabledFor(path)) return null;
+    if (!view.contentDOM.contains(target) || target.closest(SKIP_EDITOR)) return null;
+    const path = this.editorPath(view);
+    if (!path) return null;
     const position = view.posAtCoords({ x, y });
     if (position === null) return null;
     const line = view.state.doc.lineAt(position);
     const word = wordAt(line.text, position - line.from, this.settings.maxWordLength);
     if (!word) return null;
 
-    const editorOffset = line.from + word.from;
-    const from = view.domAtPos(editorOffset);
-    const to = view.domAtPos(line.from + word.to);
-    const range = view.dom.ownerDocument.createRange();
-    range.setStart(from.node, from.offset);
-    range.setEnd(to.node, to.offset);
+    const editorFrom = line.from + word.from;
+    const editorTo = line.from + word.to;
+    const range = editorDOMRange(view, editorFrom, editorTo);
     const rect = rectAt(range, x, y);
-    return rect ? { owner: view.dom, path, text: word.text, editorOffset, range, rect } : null;
+    return rect ? { owner: view.dom, path, text: word.text, editorFrom, editorTo, range, rect } : null;
+  }
+
+  selectionFor(hit) {
+    if (!hit.owner.isConnected) return null;
+    const editor = this.editors.get(hit.owner);
+    return editor ? this.editorSelection(editor) : this.readingSelection(hit.owner.ownerDocument.getSelection());
+  }
+
+  readingSelection(selection) {
+    if (!selection || selection.isCollapsed || selection.rangeCount !== 1) return null;
+    const range = selection.getRangeAt(0);
+    const start = range.startContainer;
+    const end = range.endContainer;
+    const from = this.readingContext(start.nodeType === 1 ? start : start.parentElement);
+    const to = this.readingContext(end.nodeType === 1 ? end : end.parentElement);
+    if (!from || !to || from.reading !== to.reading || from.path !== to.path) return null;
+
+    const source = selection.toString();
+    if (source.length > this.settings.maxSelectionLength) return null;
+    const text = source.trim();
+    if (!text) return null;
+    const rects = selectionRects(range, SKIP_RENDERED);
+    if (!rects.length) return null;
+    const owner = from.owner === to.owner ? from.owner : from.reading;
+    return { kind: "selection", owner, path: from.path, text, range: range.cloneRange(), rects };
+  }
+
+  editorSelection(view) {
+    const { main, ranges } = view.state.selection;
+    if (ranges.length !== 1 || main.empty || main.to - main.from > this.settings.maxSelectionLength) return null;
+    const path = this.editorPath(view);
+    if (!path || !view.visibleRanges.some(range => range.from <= main.from && range.to >= main.to)) return null;
+
+    const source = view.state.sliceDoc(main.from, main.to);
+    const text = source.trim();
+    if (!text) return null;
+    const range = editorDOMRange(view, main.from, main.to);
+    // A folded or replaced part of the selection can have no matching text in the editor DOM.
+    if (range.toString() !== source.replace(/\r?\n/g, "")) return null;
+    const rects = selectionRects(range, SKIP_EDITOR_SELECTION);
+    if (!rects.length) return null;
+    return { kind: "selection", owner: view.dom, path, text, editorFrom: main.from, editorTo: main.to, range, rects };
   }
 };
